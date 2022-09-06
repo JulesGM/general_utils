@@ -1,3 +1,5 @@
+# General Utils
+
 Generic Python boilerplate that I use in a number of projects. 
 
 It's a single file, `src/general_utils.py`.
