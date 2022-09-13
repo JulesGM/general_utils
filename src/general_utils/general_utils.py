@@ -1,31 +1,64 @@
+import time
+
 from beartype import beartype
 import collections
-import h5py  # type: ignore[import]
+import contextlib
 import functools
+import h5py  # type: ignore[import]
 import inspect
 import itertools
 import json
 import math
-from pathlib import Path
-import subprocess
-import types; 
-from typing import *
-
 import natsort
 import numpy as np
+import os
+from pathlib import Path
 import rich
+import subprocess
+import types; 
+import torch
+from typing import *
 
+
+def global_rank() -> int:
+    return int(os.environ.get("SLURM_PROCID", 0))
+
+
+def is_rank_zero():
+    return global_rank() == 0
+
+
+def rich_print_zero_rank(*args, **kwargs):
+    if is_rank_zero():
+        rich.print(*args, **kwargs)
+
+@contextlib.contextmanager
+def cuda_timeit(name, disable=False):
+    if disable:
+        yield
+        return
+
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    yield
+    torch.cuda.synchronize()
+    end = time.perf_counter()
+    rich.print(f"[bold blue]{name}[/] took {end - start:0.5f} seconds")
 
 
 ###############################################################################
 # Checks
 ###############################################################################
+def check_in(value, container):
+    assert value in container, f"{value} not in {container}"
 
-def check_shape(shape: Sequence[int], expected_shape: Sequence[int]):
-    if not shape == expected_shape:
-        raise ValueError(f"Expected shape {expected_shape}, got {shape}.")
+check_contained = check_in
 
 
+def check_equal(a, b):
+    assert a == b, f"{a} != {b}"
+
+    
 def check_isinstance(obj, types):
     assert isinstance(obj, types), f"{type(obj).mro()} is not a subclass of {types}"
 
@@ -33,10 +66,6 @@ def check_isinstance(obj, types):
 def check_not_equal(a, b):
     assert a != b, f"{a} == {b}"
     
-    
-def check_equal(a, b):
-    assert a == b, f"{a} != {b}"
-
 
 def check_and_print_args(all_arguments, function, has_classmethod_cls=False, root_path=None):
     check_args(all_arguments, function, has_classmethod_cls)
@@ -66,6 +95,12 @@ def check_args(all_arguments, function, has_classmethod_cls=False):
         f"\n{sorted(all_arguments.keys())} != "
         f"{sorted(inspect.signature(function).parameters.keys())}"
     )
+
+
+def check_shape(shape: Sequence[int], expected_shape: Sequence[int]):
+    if not shape == expected_shape:
+        raise ValueError(f"Expected shape {expected_shape}, got {shape}.")
+
 
 ###############################################################################
 # Print utils
@@ -141,6 +176,15 @@ def to_human_size(size: int) -> str:
 ###############################################################################
 # Common collection manipulations, including strings and iterators
 ###############################################################################
+def repeat_interleave(iterable, n: int):
+    return itertools.chain.from_iterable(
+        itertools.repeat(x, n) for x in iterable)
+
+
+def safe_xor(a, b):
+    return bool(a) ^ bool(b)
+    
+
 def setattr_must_exist(obj, key, value):
     assert hasattr(obj, key), f"Key `{key}` does not exist."
     setattr(obj, key, value)
