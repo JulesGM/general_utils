@@ -8,6 +8,7 @@ import h5py  # type: ignore[import]
 import inspect
 import itertools
 import json
+import logging
 import math
 import natsort
 import numpy as np
@@ -18,6 +19,40 @@ import subprocess
 import types; 
 import torch
 from typing import *
+
+
+def log_rank_0(logger, level, message):
+    if os.getenv("RANK", "0") == "0":
+        logger.log(level, "[white bold]\[log-zero]:[/] " + message)
+
+
+def info_rank_0(logger, message):
+    log_rank_0(logger, logging.INFO, message)
+
+
+def debug_rank_0(logger, message):
+    log_rank_0(logger, logging.DEBUG, message)
+
+
+
+def color_cycle(text, colors_fg=None, colors_bg=None):
+    assert colors_fg or colors_bg, "Must specify at least one color."
+    
+    output = []
+    
+    color_it = iter(zip(
+        itertools.cycle(colors_fg) if colors_fg else itertools.repeat(""),
+        itertools.cycle(colors_bg) if colors_bg else itertools.repeat(""),
+    ))
+    
+    for char in text:
+        fg, bg = next(color_it)
+        bg = f"on {bg}" if bg else ""
+        # Appending to a string repetitively has bad algorithmic complexity, because a new string is created each time.
+        # We use a list instead.
+        output.append(f"[{fg}{bg}]{char}[/{fg}{bg}]")
+    
+    return "".join(output)
 
 
 def global_rank() -> int:
@@ -43,14 +78,26 @@ def cuda_timeit(name, disable=False):
     yield
     torch.cuda.synchronize()
     end = time.perf_counter()
-    rich.print(f"[bold blue]{name}[/] took {end - start:0.5f} seconds")
+    rich.print(f"\n[bold blue]{name}[/] took {end - start:0.5f} seconds")
+
+
+@contextlib.contextmanager
+def ctx_timeit(name, disable=False):
+    if disable:
+        yield
+        return
+
+    start = time.perf_counter()
+    yield
+    end = time.perf_counter()
+    rich.print(f"\n[bold blue]{name}[/] took {end - start:0.5f} seconds")
 
 
 ###############################################################################
 # Checks
 ###############################################################################
 def check_in(value, container):
-    assert value in container, f"{value} not in {container}"
+    assert value in container, f"\"{value}\" not in {container}"
 
 check_contained = check_in
 
@@ -118,19 +165,40 @@ def print_list(_list, root_path=None):
         rich.print("\t[bright_black]<empty list>")
 
 
-def print_dict(_dict: dict[str, Any], root_path=None) -> None:
+def print_dict(
+    _dict: dict[str, Any], 
+    root_path=None, 
+    return_str=False,
+) -> None:
     # Pad by key length
     max_len = len(max(_dict, key=lambda key: len(str(key)))) + 1
     at_least_one = False
+
+    if return_str:
+        output = []
+
     for k, value in _dict.items():
         at_least_one = True
         if root_path and isinstance(value, (Path, str)):
             value = shorten_path(value, root_path)
 
-        rich.print(f"\t- {k} =" + (max_len - len(k)) * " " + f" {value}")
+        text = (
+            f"\t- [white bold]{k}[/] " + 
+            (max_len - len(k)) * " " + 
+            f" = [green]{value}"
+        )
 
-    if not at_least_one:
-        rich.print("\t[bright_black]<empty dict>")
+        if return_str:
+            output.append(text)
+        else:
+            rich.print(text)
+
+    if not return_str:
+        if not at_least_one:
+            rich.print("\t[bright_black]<empty dict>")
+
+    if return_str:
+        return "\n".join(output)
 
 
 def clean_locals(locals_, no_modules=True, no_classes=True, no_functions=True, no_caps=True):
@@ -260,8 +328,8 @@ def only_one(it: Iterable):
     return good
 
 
-def find_last(seq: Sequence[Any], item: Any) -> int:
-    return len(seq) - seq[::-1].index(item) - 1
+def find_last(find_in: Sequence[Any], find_what: Any) -> int:
+    return len(find_in) - find_in[::-1].index(find_what) - 1
 
 
 def sort_iterable_text(list_text):
