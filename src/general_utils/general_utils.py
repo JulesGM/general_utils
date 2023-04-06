@@ -1,3 +1,4 @@
+import sys
 import time
 
 from beartype import beartype
@@ -19,78 +20,251 @@ import subprocess
 import types; 
 import torch
 from typing import *
+import ipdb
 
 
-def log_rank_0(logger, level, message):
-    if os.getenv("RANK", "0") == "0":
-        logger.log(level, "[white bold]\[log-zero]:[/] " + message)
-
-
-def info_rank_0(logger, message):
-    log_rank_0(logger, logging.INFO, message)
-
-
-def debug_rank_0(logger, message):
-    log_rank_0(logger, logging.DEBUG, message)
-
-
-
-def color_cycle(text, colors_fg=None, colors_bg=None):
-    assert colors_fg or colors_bg, "Must specify at least one color."
-    
-    output = []
-    
-    color_it = iter(zip(
-        itertools.cycle(colors_fg) if colors_fg else itertools.repeat(""),
-        itertools.cycle(colors_bg) if colors_bg else itertools.repeat(""),
-    ))
-    
-    for char in text:
-        fg, bg = next(color_it)
-        bg = f"on {bg}" if bg else ""
-        # Appending to a string repetitively has bad algorithmic complexity, because a new string is created each time.
-        # We use a list instead.
-        output.append(f"[{fg}{bg}]{char}[/{fg}{bg}]")
-    
-    return "".join(output)
-
-
-def global_rank() -> int:
-    return int(os.environ.get("SLURM_PROCID", 0))
-
-
-def is_rank_zero():
-    return global_rank() == 0
-
-
-def rich_print_zero_rank(*args, **kwargs):
-    if is_rank_zero():
-        rich.print(*args, **kwargs)
+LOGGER = logging.getLogger(__name__)
 
 @contextlib.contextmanager
-def cuda_timeit(name, disable=False):
+def maybe_context(
+    condition, 
+    context_obj=None, 
+    context_class=None, 
+    context_args=None, 
+    context_kwargs=None,
+):
+    if condition:
+        assert (context_obj is None) ^ (context_class is None), (
+            context_obj, context_class)
+        
+        if context_obj is not None:
+            with context_obj:
+                yield
+        elif context_class is not None:
+            if context_args is None:
+                context_args = ()
+            if context_kwargs is None:
+                context_kwargs = {}
+            with context_class(
+                *context_args, 
+                **context_kwargs,
+            ):
+                yield
+    else:
+        yield
+
+
+def dist_trace(ranks="all", frame=None, context=None, cond=True):
+    """ Distributed ipdb trace.
+    
+    Set a breakpoint on all ranks, or a subset of ranks.
+    
+    ranks: int, "all", or iterable of ints
+    
+    The other args are the same as ipdb.set_trace.
+    """
+
+    if isinstance(ranks, int):
+        ranks_we_care_about = (ranks,)
+    elif rank == "all":
+        ranks_we_care_about = range(torch.distributed.get_world_size())
+    else:
+        try:
+            ranks_we_care_about = iter(ranks)
+        except TypeError:
+            raise TypeError(
+                f"rank must be int, 'all', or iterable. "
+                f"Got {type(ranks).mro() = }"
+            )
+
+    for rank in ranks_we_care_about:
+        if torch.distributed.get_rank() == rank:
+            # The frame needs to be computed relative to the current one,
+            # not dist-trace's inner one
+            assert frame is None
+
+            if frame is None:
+                frame = sys._getframe().f_back
+            ipdb.set_trace(frame=frame, context=context, cond=cond)
+        torch.distributed.barrier()
+
+
+def all_gather(tensor):
+    """ More pythonic all_gather """
+    world_size = torch.distributed.get_world_size()
+    output = [tensor.clone() for _ in range(world_size)]
+    torch.distributed.all_gather(output, tensor)
+    return torch.stack(output, dim=0)
+
+
+def batched_gather(tensor, batch_size):
+    outputs = []
+    local_rank = torch.distributed.get_local_rank()
+    for i in range(0, tensor.shape[0], batch_size):
+        gathered = all_gather(
+            tensor[i:i + batch_size].to(local_rank)
+        )
+        outputs.append(gathered.cpu())
+    return torch.cat(outputs, dim=1)
+
+
+def parallel_guard(name, do_print=True):
+    """ Named barrier. 
+    
+    Makes sure all ranks are at a similarly named point. 
+    Regular barriers are not named, so it's possible that
+    one rank is at a different point than another.
+
+    """
+
+    world_size = torch.distributed.get_world_size()
+    guard      = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(guard, name)
+    
+    if do_print:
+        rank       = torch.distributed.get_rank()
+        header     = f"[{rank}/{world_size}][parallel_guard]"
+        print(f"{header} do_print: {name = }")
+
+    assert all([m == name for m in guard]), (
+        f"[{rank}/{world_size}]" + "\n\t- " + "\n\t- ".join(
+            [str(x) for x in guard]
+        ) + "\n"
+    )
+
+
+def all_gather_object(obj):
+    """ More pythonic all_gather_object """
+    world_size = torch.distributed.get_world_size()
+    stuff = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(stuff, obj)
+    return stuff
+
+
+def broadcast_object(obj, source=0):
+    """ More pythonic broadcast_object_list """
+    stuff = [obj]
+    torch.distributed.broadcast_object_list(stuff, src=source)
+    return stuff[0]
+
+
+def parallel_log(logger, level, message):
+    """ 
+    
+    If the message is the same for all ranks, log it once, 
+    otherwise log it for each rank, in order.
+    
+    """
+
+    parallel_guard("parallel_log", do_print=False)
+
+    messages   = all_gather_object(message)
+    world_size = torch.distributed.get_world_size()
+    rank       = torch.distributed.get_rank()
+
+    if all(m == message for m in messages):
+        if rank == 0:
+            logger.log(level, f"[bright black][ALL_IDENTICAL]:[/] {message}")
+    else:
+        for i in range(world_size):
+            if i == rank:
+                logger.log(level, f"[bright black][DIFFERENT]:[/] {message}")
+            torch.distributed.barrier()
+
+
+def pinfo(logger, message):
+    """ Logging shorthand """
+    parallel_log(logger, level=logging.INFO, message=message)
+
+
+def parallel_print(message):
+    """ 
+    
+    If the message is the same for all ranks, log it once, 
+    otherwise log it for each rank, in order.
+    
+    """
+
+    parallel_guard("parallel_print", do_print=False)
+
+    messages   = all_gather_object(message)
+    world_size = torch.distributed.get_world_size()
+    rank       = torch.distributed.get_rank()
+
+    if all(m == message for m in messages):
+        if rank == 0:
+            rich.print(f"[bright black][ALL_IDENTICAL]:[/] {message}")
+    else:
+        for i in range(world_size):
+            if i == rank:
+                rich.print(f"[bright black][DIFFERENT]:[/] {message}")
+            torch.distributed.barrier()
+
+
+
+@contextlib.contextmanager
+def ctx_timeit(
+    name: str, 
+    *,
+    accelerate_sync: bool = False,
+    accelerator: Optional["accelerate.Accelerator"] = None,
+    cuda_sync: bool = False,
+    disable: bool = False,
+    logger: Optional[logging.Logger] = None,
+    log_level: Union[str, int]=logging.DEBUG,
+):
     if disable:
         yield
         return
+    
+    # -------------------------------------------------------------------------
+    # Create the starting message
+    # -------------------------------------------------------------------------
+    message_start = f"[bold blue]Starting \"{name}\"[/].."
+    if cuda_sync:
+        message_start += " [bold white on red](USING CUDA SYNC)"
 
-    torch.cuda.synchronize()
+    if logger:
+        logger.log(log_level, message_start)
+    else:
+        rich.print(message_start)
+
+    # -------------------------------------------------------------------------
+    # Sync and start the timer
+    # -------------------------------------------------------------------------
     start = time.perf_counter()
+    if cuda_sync:
+        torch.cuda.synchronize()
+    if accelerate_sync:
+        assert accelerator is not None, (
+            "accelerator must be specified if accelerate_sync is True"
+        )
+        accelerator.wait_for_everyone()
+
+    # -------------------------------------------------------------------------
+    # Yield
+    # -------------------------------------------------------------------------
     yield
-    torch.cuda.synchronize()
-    end = time.perf_counter()
-    rich.print(f"\n[bold blue]{name}[/] took {end - start:0.5f} seconds")
 
+    # -------------------------------------------------------------------------
+    # Sync and end the timer
+    # -------------------------------------------------------------------------
+    if cuda_sync:
+        torch.cuda.synchronize()
+    if accelerate_sync:
+        accelerator.wait_for_everyone()
+    delta = time.perf_counter() - start
 
-@contextlib.contextmanager
-def ctx_timeit(name, disable=False):
-    if disable:
-        yield
-        return
-
-    start = time.perf_counter()
-    yield
-    end = time.perf_counter()
-    rich.print(f"\n[bold blue]{name}[/] took {end - start:0.5f} seconds")
+    # -------------------------------------------------------------------------
+    # Create the ending message
+    # -------------------------------------------------------------------------
+    message_end = f"\n[bold blue]Done \"{name}\"[/] took {delta:0.5f} seconds."
+    if cuda_sync:
+        message_end += " [bold white on red](USING CUDA SYNC)"
+    if logger:
+        logger.log(log_level, message_end)
+    else:
+        rich.print(message_end)
 
 
 ###############################################################################
@@ -169,13 +343,13 @@ def print_dict(
     _dict: dict[str, Any], 
     root_path=None, 
     return_str=False,
+    logger=None,
+    log_level=logging.INFO,
 ) -> None:
     # Pad by key length
     max_len = len(max(_dict, key=lambda key: len(str(key)))) + 1
     at_least_one = False
-
-    if return_str:
-        output = []
+    output = []
 
     for k, value in _dict.items():
         at_least_one = True
@@ -185,17 +359,29 @@ def print_dict(
         text = (
             f"\t- [white bold]{k}[/] " + 
             (max_len - len(k)) * " " + 
-            f" = [green]{value}"
+            f" = [green]{value}[/]"
         )
 
-        if return_str:
-            output.append(text)
-        else:
-            rich.print(text)
+        output.append(text)        
 
     if not return_str:
         if not at_least_one:
-            rich.print("\t[bright_black]<empty dict>")
+            rich.print(
+                "\t[bright_black]<empty dict>"
+            )
+
+    if logger is None:
+        logger = rich.print(
+            "\n".join(output),
+        )
+    else:
+        if isinstance(log_level, str):
+            log_level = logging.getLevelName(log_level)
+            
+        logger.log(
+            log_level, 
+            "\n" + "\n".join(output),
+        )
 
     if return_str:
         return "\n".join(output)
@@ -291,12 +477,13 @@ def dict_unzip(list_of_dicts: list[dict[Any, Any]], key_subset=None) -> dict[Any
     """
     Unzips a list of dicts with the same keys into a dict of lists.
     """
+
     if key_subset is None:
         keys = list_of_dicts[0].keys()
     else:
         keys = key_subset
 
-    dict_of_lists = collections.defaultdict(list)
+    dict_of_lists = {k: [] for k in keys}
     
     for ld in list_of_dicts:
         assert ld.keys() == keys, f"{ld.keys()} != {keys}"
@@ -304,6 +491,20 @@ def dict_unzip(list_of_dicts: list[dict[Any, Any]], key_subset=None) -> dict[Any
             dict_of_lists[k].append(ld[k])
 
     return dict_of_lists
+
+def dict_unzip2(gen_of_dicts):
+    output = collections.defaultdict(list)
+    keys = None
+    for d in gen_of_dicts:
+        if keys is None:
+            keys = d.keys()
+        else:
+            assert keys == d.keys(), f"{keys} != {d.keys()}"
+        
+        for k, v in d.items():
+            output[k].append(v)
+
+
 
 
 def concat_lists(lists):
